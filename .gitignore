@@ -1,0 +1,81 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Claude Code
+.claude/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb_checkpoints/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# Large data files
+*.txt.gz
+*.json.gz
+*.pkl
+*.parquet
+
+# Training data
+data/train*.txt
+data/valid*.txt
+data/test*.txt
+assignment*/data/*.txt
+assignment*/data/*.gz
+
+# Model files
+*.safetensors
+*.pth
+*.pt
+*.bin
+*.ckpt
+
+# Traces and databases
+*.sqlite
+*.db
+traces/
+
+# Nested git repos
+*/.git/
+
+# Weights and checkpoints
+checkpoint/
+weights/
+models/
