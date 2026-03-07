@@ -11,9 +11,8 @@ BPE (Byte Pair Encoding) 分词器训练实现
 """
 
 import os
-import re
 from collections import defaultdict
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Iterable, Iterator
 import regex
 
 # GPT-2 预分词模式
@@ -21,6 +20,70 @@ import regex
 GPT2_PATTERN = regex.compile(
     r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 )
+
+
+# ==================== 辅助函数：预分词 ====================
+
+def _split_by_special_tokens(text: str, special_tokens: list[str]) -> list[str]:
+    """
+    按特殊 tokens 分割文本（保留特殊 tokens）
+
+    参数：
+        text: 输入文本
+        special_tokens: 特殊 token 列表
+
+    返回：
+        分割后的文本块列表（包含特殊 tokens）
+    """
+    if not special_tokens:
+        return [text]
+
+    # 按长度降序排序，确保优先匹配长的 tokens（如 "<eos>" 先于 "<"）
+    sorted_tokens = sorted(special_tokens, key=len, reverse=True)
+    split_pattern = "|".join(regex.escape(tok) for tok in sorted_tokens)
+    # 使用捕获组来保留分隔符（特殊 tokens）
+    return regex.split(f'({split_pattern})', text)
+
+
+def _pretokenize_chunk(chunk: str) -> list[str]:
+    """
+    使用 GPT-2 regex 对文本块进行预分词
+
+    参数：
+        chunk: 文本块
+
+    返回：
+        预分词后的 tokens 列表
+    """
+    return regex.findall(GPT2_PATTERN, chunk)
+
+
+def _preprocess_text(text: str, special_tokens: list[str]) -> list[str]:
+    """
+    统一的文本预处理流程：分割特殊 tokens + GPT-2 预分词
+
+    参数：
+        text: 输入文本
+        special_tokens: 特殊 token 列表
+
+    返回：
+        预分词后的 tokens 列表（已排除特殊 tokens 本身）
+
+    示例：
+        >>> _preprocess_text("Hello world!<eos>How are you?", ["<eos>"])
+        ['Hello', ' world!', 'How', ' are', ' you?']
+    """
+    # 1. 按特殊 tokens 分割
+    chunks = _split_by_special_tokens(text, special_tokens)
+
+    # 2. 对每个 chunk 进行 GPT-2 预分词
+    result = []
+    for chunk in chunks:
+        # 跳过特殊 tokens 本身（它们会被单独处理）
+        if chunk not in special_tokens:
+            result.extend(_pretokenize_chunk(chunk))
+
+    return result
 
 
 def run_train_bpe(
@@ -104,34 +167,25 @@ def run_train_bpe(
 
     # ==================== 第4步：预处理和预分词 ====================
 
-    # 4.1 按特殊 tokens 分割文本
-    # 关键：防止跨特殊 token 边界进行合并
-    # 例如："Hello<eos>World" 应该分割为 ["Hello", "World"]
-    if special_tokens:
-        # 构建分割模式，用 | 连接所有特殊 tokens
-        # regex.escape 确保 | 等特殊字符被正确转义
-        split_pattern = "|".join(re.escape(tok) for tok in special_tokens)
-        chunks = regex.split(split_pattern, text)
-    else:
-        chunks = [text]
+    # 使用统一的预分词函数处理文本
+    # 这会：
+    # 1. 按特殊 tokens 分割，防止跨边界合并
+    # 2. 应用 GPT-2 regex 预分词，保留语言学特征
+    pre_tokens = _preprocess_text(text, special_tokens)
 
-    # 4.2 对每个 chunk 进行预分词
-    # 使用 GPT-2 regex 模式进行预分词
-    # 这会保留语言学特征，如缩写、标点、空格等
-    token_frequency_table = defaultdict(int)  # 统计每个字节序列的频率
+    # 统计每个字节序列的频率
+    token_frequency_table = defaultdict(int)
 
-    for chunk in chunks:
-        # 使用 GPT-2 regex 找到所有预 tokens
-        for word in regex.findall(GPT2_PATTERN, chunk):
-            # 将预 token 转换为字节序列
-            word_bytes = word.encode("utf-8")
+    for word in pre_tokens:
+        # 将预 token 转换为字节序列
+        word_bytes = word.encode("utf-8")
 
-            # 转换为字节元组（可哈希，可作为字典键）
-            # 例如：b'hello' -> (b'h', b'e', b'l', b'l', b'o')
-            byte_tuple = tuple(bytes([b]) for b in word_bytes)
+        # 转换为字节元组（可哈希，可作为字典键）
+        # 例如：b'hello' -> (b'h', b'e', b'l', b'l', b'o')
+        byte_tuple = tuple(bytes([b]) for b in word_bytes)
 
-            # 统计频率
-            token_frequency_table[byte_tuple] += 1
+        # 统计频率
+        token_frequency_table[byte_tuple] += 1
 
     # ==================== 第5步：初始化 pair 频率统计 ====================
     # 使用 defaultdict 方便计数
@@ -234,12 +288,19 @@ def _merge_pair_in_sequence(
         >>> _merge_pair_in_sequence((b'h', b'e', b'l', b'l', b'o'), (b'l', b'l'), b'll')
         (b'h', b'e', b'll', b'o')
     """
+    pair_len = len(byte_sequence)
+
+    # 预分配结果列表（优化：避免动态扩容）
     new_sequence = []
+    new_sequence_reserve = pair_len  # 预估最大大小
     i = 0
 
-    while i < len(byte_sequence):
+    # 提取 pair 的两个元素（优化：避免重复索引访问）
+    p1, p2 = pair
+
+    while i < pair_len:
         # 检查当前位置是否是要合并的 pair
-        if i < len(byte_sequence) - 1 and byte_sequence[i] == pair[0] and byte_sequence[i + 1] == pair[1]:
+        if i + 1 < pair_len and byte_sequence[i] == p1 and byte_sequence[i + 1] == p2:
             # 找到要合并的 pair，替换为新 token
             new_sequence.append(new_token)
             i += 2  # 跳过两个元素
@@ -287,6 +348,272 @@ def save_vocab_and_merges(
             f.write(f"{p1_str} {p2_str}\n")
 
 
+# ==================== Tokenizer 类实现 ====================
+
+class Tokenizer:
+    """
+    BPE 分词器实现
+
+    支持的功能：
+    1. 编码文本为 token IDs
+    2. 解码 token IDs 为文本
+    3. 特殊 tokens 处理
+    4. 流式编码大文件
+    """
+
+    def __init__(
+        self,
+        vocab: dict[int, bytes],
+        merges: list[tuple[bytes, bytes]],
+        special_tokens: list[str] | None = None,
+    ):
+        """
+        从给定的词汇表、合并规则和特殊 tokens 构造分词器
+
+        参数：
+            vocab: dict[int, bytes] - Token ID 到 token 字节的映射
+            merges: list[tuple[bytes, bytes]] - 按合并顺序排列的合并规则
+            special_tokens: list[str] | None - 特殊 token 列表
+        """
+        # 词汇表：bytes -> int 的映射（用于快速查找）
+        self._vocab_bytes_to_id: dict[bytes, int] = {
+            v: k for k, v in vocab.items()
+        }
+        # 保存原始词汇表
+        self._vocab_id_to_bytes: dict[int, bytes] = vocab.copy()
+
+        # 合并规则：bytes pair -> 合并后的 bytes
+        self._merge_map: dict[tuple[bytes, bytes], bytes] = {}
+        for p1, p2 in merges:
+            merged = p1 + p2
+            self._merge_map[(p1, p2)] = merged
+
+        # 特殊 tokens
+        self._special_tokens: set[str] = set(special_tokens) if special_tokens else set()
+        # 特殊 tokens 的字节表示
+        self._special_token_bytes: dict[bytes, str] = {}
+        # 特殊 tokens 的 ID
+        self._special_token_ids: set[int] = set()
+
+        for st in self._special_tokens:
+            st_bytes = st.encode("utf-8")
+            self._special_token_bytes[st_bytes] = st
+            if st_bytes in self._vocab_bytes_to_id:
+                self._special_token_ids.add(self._vocab_bytes_to_id[st_bytes])
+
+        # 按长度降序排序特殊 tokens（用于优先匹配长 tokens）
+        self._sorted_special_tokens: list[tuple[bytes, str]] = sorted(
+            self._special_token_bytes.items(),
+            key=lambda x: len(x[0]),
+            reverse=True
+        )
+
+    @classmethod
+    def from_files(
+        cls,
+        vocab_filepath: str,
+        merges_filepath: str,
+        special_tokens: list[str] | None = None,
+    ) -> "Tokenizer":
+        """
+        从序列化的词汇表和合并规则文件构造分词器
+
+        参数：
+            vocab_filepath: 词汇表文件路径（JSON 格式）
+            merges_filepath: 合并规则文件路径
+            special_tokens: list[str] | None - 特殊 token 列表
+        """
+        import json
+
+        # 读取词汇表
+        with open(vocab_filepath, "r", encoding="utf-8") as f:
+            vocab_str = json.load(f)
+
+        vocab: dict[int, bytes] = {}
+        for token_id_str, token_str in vocab_str.items():
+            token_id = int(token_id_str)
+            token_bytes = token_str.encode("utf-8")
+            vocab[token_id] = token_bytes
+
+        # 读取合并规则
+        merges: list[tuple[bytes, bytes]] = []
+        with open(merges_filepath, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split()
+                if len(parts) == 2:
+                    p1 = parts[0].encode("utf-8")
+                    p2 = parts[1].encode("utf-8")
+                    merges.append((p1, p2))
+
+        return cls(vocab, merges, special_tokens)
+
+    def encode(self, text: str) -> list[int]:
+        """
+        编码输入文本为 token ID 序列
+
+        参数：
+            text: 输入文本
+
+        返回：
+            list[int]: token ID 序列
+        """
+        if not text:
+            return []
+
+        result = []
+        special_tokens_list = list(self._special_tokens)
+
+        # 按特殊 tokens 分割文本（保留特殊 tokens）
+        chunks = _split_by_special_tokens(text, special_tokens_list)
+
+        # 对每个 chunk 按顺序处理
+        for chunk in chunks:
+            # 如果是特殊 token，直接编码
+            if chunk in self._special_tokens:
+                part_bytes = chunk.encode("utf-8")
+                if part_bytes in self._vocab_bytes_to_id:
+                    result.append(self._vocab_bytes_to_id[part_bytes])
+            else:
+                # 普通文本：使用 GPT-2 预分词 + BPE
+                pre_tokens = _pretokenize_chunk(chunk)
+                for word in pre_tokens:
+                    word_bytes = word.encode("utf-8")
+                    tokens = [bytes([b]) for b in word_bytes]
+                    merged = self._apply_bpe(tokens)
+                    result.extend(merged)
+
+        return result
+    def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
+        """
+        对字符串的可迭代对象（如文件句柄）进行流式编码
+
+        这个方法支持内存高效地处理大文件，不会一次性加载全部内容到内存
+
+        参数：
+            iterable: 可迭代的字符串集合
+
+        返回：
+            Iterator[int]: token ID 生成器
+        """
+        # 逐行处理，保持内存效率
+        for line in iterable:
+            ids = self.encode(line)
+            yield from ids
+
+    def decode(self, ids: list[int]) -> str:
+        """
+        解码 token ID 序列为文本
+
+        参数：
+            ids: token ID 序列
+
+        返回：
+            str: 解码后的文本
+
+        异常：
+            ValueError: 当遇到无效的 token ID 时抛出
+        """
+        if not ids:
+            return ""
+
+        # 收集所有 token 的字节
+        all_bytes = []
+        invalid_ids = []
+
+        for token_id in ids:
+            if token_id in self._vocab_id_to_bytes:
+                all_bytes.append(self._vocab_id_to_bytes[token_id])
+            else:
+                invalid_ids.append(token_id)
+
+        # 如果有无效 ID，抛出异常而不是静默处理
+        if invalid_ids:
+            raise ValueError(
+                f"发现无效的 token IDs: {invalid_ids}. "
+                f"这些 ID 不在词汇表（大小: {len(self._vocab_id_to_bytes)}）中。"
+            )
+
+        # 合并并解码
+        combined = b"".join(all_bytes)
+        return combined.decode("utf-8", errors="replace")
+
+    def _apply_bpe(self, tokens: list[bytes]) -> list[int]:
+        """
+        对字节 tokens 应用 BPE 合并规则
+        
+        简化版本：每次合并后重建 pairs（更可靠）
+
+        参数：
+            tokens: 字节 token 列表
+
+        返回：
+            list[int]: 合并后的 token ID 列表
+        """
+        if len(tokens) <= 1:
+            return [self._vocab_bytes_to_id[t] for t in tokens if t in self._vocab_bytes_to_id]
+
+        # 初始化所有可合并的 pair
+        pairs: dict[tuple[bytes, bytes], list[int]] = {}
+        for i in range(len(tokens) - 1):
+            pair = (tokens[i], tokens[i + 1])
+            if pair in self._merge_map:
+                pairs.setdefault(pair, []).append(i)
+
+        # 按优先级顺序应用合并规则
+        while pairs:
+            # 找优先级最高的可合并 pair（按 merges 列表顺序）
+            best_pair = None
+            for p1, p2 in self._merge_map.keys():
+                if (p1, p2) in pairs and pairs[(p1, p2)]:
+                    best_pair = (p1, p2)
+                    break
+            
+            if best_pair is None:
+                break
+            
+            # 获取该 pair 的所有位置
+            positions = sorted(pairs[best_pair], reverse=True)
+            del pairs[best_pair]
+            
+            if not positions:
+                continue
+            
+            merged_token = self._merge_map[best_pair]
+            
+            # 从后往前合并，避免索引问题
+            offset = 0
+            for pos in positions:
+                actual_pos = pos + offset
+                # 验证这个位置的 pair 还是正确的
+                if (actual_pos < len(tokens) - 1 and
+                    tokens[actual_pos] == best_pair[0] and
+                    tokens[actual_pos + 1] == best_pair[1]):
+                    tokens[actual_pos:actual_pos + 2] = [merged_token]
+                    offset -= 1
+            
+            # 重新构建 pairs（简单可靠）
+            pairs = {}
+            for i in range(len(tokens) - 1):
+                pair = (tokens[i], tokens[i + 1])
+                if pair in self._merge_map:
+                    pairs.setdefault(pair, []).append(i)
+
+        # 将 bytes 转换为 IDs
+        result = []
+        for token in tokens:
+            if token in self._vocab_bytes_to_id:
+                result.append(self._vocab_bytes_to_id[token])
+            else:
+                # 降级处理：分解为单字节
+                for b in token:
+                    single_byte = bytes([b])
+                    if single_byte in self._vocab_bytes_to_id:
+                        result.append(self._vocab_bytes_to_id[single_byte])
+        
+        return result
 # ==================== 测试和调试 ====================
 
 if __name__ == "__main__":
