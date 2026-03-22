@@ -1,0 +1,663 @@
+"""
+BPE (Byte Pair Encoding) 分词器训练实现
+
+本模块实现了字节级别的 BPE 分词器训练算法，包括：
+1. 字节级别的 BPE 训练
+2. 特殊 tokens 处理
+3. GPT-2 风格的预分词
+4. 增量更新优化
+
+主要参考: Sennrich et al., 2016 - https://arxiv.org/abs/1508.07909
+"""
+
+import os
+from collections import defaultdict
+from typing import List, Tuple, Dict, Iterable, Iterator
+import regex
+
+# GPT-2 预分词模式
+# 这个正则表达式保留了缩写、标点符号、空格等语言学特征
+GPT2_PATTERN = regex.compile(
+    r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+)
+
+
+# ==================== 辅助函数：预分词 ====================
+
+def _split_by_special_tokens(text: str, special_tokens: list[str]) -> list[str]:
+    """
+    按特殊 tokens 分割文本
+
+    参数：
+        text: 输入文本
+        special_tokens: 特殊 token 列表
+
+    返回：
+        分割后的文本块列表
+    """
+    if not special_tokens:
+        return [text]
+
+    # 按长度降序排序，确保优先匹配长的 tokens（如 "<eos>" 先于 "<"）
+    sorted_tokens = sorted(special_tokens, key=len, reverse=True)
+    split_pattern = "|".join(regex.escape(tok) for tok in sorted_tokens)
+    return regex.split(split_pattern, text)
+
+
+def _pretokenize_chunk(chunk: str) -> list[str]:
+    """
+    使用 GPT-2 regex 对文本块进行预分词
+
+    参数：
+        chunk: 文本块
+
+    返回：
+        预分词后的 tokens 列表
+    """
+    return regex.findall(GPT2_PATTERN, chunk)
+
+
+def _preprocess_text(text: str, special_tokens: list[str]) -> list[str]:
+    """
+    统一的文本预处理流程：分割特殊 tokens + GPT-2 预分词
+
+    参数：
+        text: 输入文本
+        special_tokens: 特殊 token 列表
+
+    返回：
+        预分词后的 tokens 列表（已排除特殊 tokens 本身）
+
+    示例：
+        >>> _preprocess_text("Hello world!<eos>How are you?", ["<eos>"])
+        ['Hello', ' world!', 'How', ' are', ' you?']
+    """
+    # 1. 按特殊 tokens 分割
+    chunks = _split_by_special_tokens(text, special_tokens)
+
+    # 2. 对每个 chunk 进行 GPT-2 预分词
+    result = []
+    for chunk in chunks:
+        # 跳过特殊 tokens 本身（它们会被单独处理）
+        if chunk not in special_tokens:
+            result.extend(_pretokenize_chunk(chunk))
+
+    return result
+
+
+def run_train_bpe(
+    input_path: str | os.PathLike,
+    vocab_size: int,
+    special_tokens: list[str],
+    **kwargs,
+) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
+    """
+    训练一个字节级别的 BPE 分词器
+
+    ================== 算法流程 ==================
+
+    1. 初始化词汇表：
+       - 256 个基础字节 (0-255)
+       - 特殊 tokens（优先添加）
+
+    2. 预处理语料：
+       - 按特殊 tokens 分割文本
+       - 使用 GPT-2 regex 预分词
+       - 转换为字节序列
+
+    3. 迭代合并：
+       重复直到词汇表达到 vocab_size：
+       a. 统计相邻字节对频率
+       b. 选择最频繁的字节对
+       c. 创建新 token = pair[0] + pair[1]
+       d. 在所有序列中合并该 pair
+       e. 增量更新 pair 频率（优化）
+
+    ===============================================
+
+    参数：
+        input_path: 训练文本文件路径
+        vocab_size: 目标词汇表大小（包括基础字节、特殊 tokens、合并产生的新 tokens）
+        special_tokens: 特殊 token 列表，如 ["<eos>", "<pad>"]
+
+    返回：
+        vocab: dict[int, bytes] - Token ID 到 Token 字节的映射
+               例如: {0: b'\x00', ..., 256: b'<eos>', 257: b'ing', ...}
+
+        merges: list[tuple[bytes, bytes]] - 按合并顺序排列的合并规则
+               例如: [(b'e', b'r'), (b'er', b'ing'), ...]
+               表示 b'e' + b'er' -> b'ering'
+    """
+
+    # ==================== 第1步：参数校验 ====================
+    if not isinstance(vocab_size, int) or vocab_size <= 0:
+        raise ValueError("vocab_size 必须是正整数")
+
+    # ==================== 第2步：初始化词汇表 ====================
+    # 基础词汇表：所有 256 个字节
+    # 每个字节是一个独立的 token，ID 从 0 到 255
+    vocab: Dict[int, bytes] = {i: bytes([i]) for i in range(256)}
+    next_token_id: int = 256  # 新 token ID 从 256 开始
+
+    # 集合用于快速检查字节值是否已存在
+    existing_byte_values = set(vocab.values())
+
+    # 添加特殊 tokens 到词汇表（优先级最高）
+    for st_str in special_tokens:
+        # 如果词汇表已满，停止添加
+        if len(vocab) >= vocab_size:
+            break
+
+        st_bytes = st_str.encode("utf-8")  # 将特殊 token 转为字节
+
+        # 避免重复：只在字节值不存在时添加
+        # 例如：特殊 token "a" 和基础字节 b'a' 不能重复
+        if st_bytes not in existing_byte_values:
+            vocab[next_token_id] = st_bytes
+            existing_byte_values.add(st_bytes)
+            next_token_id += 1
+
+    # ==================== 第3步：读取训练语料 ====================
+    try:
+        with open(input_path, "r", encoding="utf-8", errors="ignore") as f:
+            text = f.read()
+    except FileNotFoundError:
+        text = ""  # 文件不存在时视为空文本
+
+    # ==================== 第4步：预处理和预分词 ====================
+
+    # 使用统一的预分词函数处理文本
+    # 这会：
+    # 1. 按特殊 tokens 分割，防止跨边界合并
+    # 2. 应用 GPT-2 regex 预分词，保留语言学特征
+    pre_tokens = _preprocess_text(text, special_tokens)
+
+    # 统计每个字节序列的频率
+    token_frequency_table = defaultdict(int)
+
+    for word in pre_tokens:
+        # 将预 token 转换为字节序列
+        word_bytes = word.encode("utf-8")
+
+        # 转换为字节元组（可哈希，可作为字典键）
+        # 例如：b'hello' -> (b'h', b'e', b'l', b'l', b'o')
+        byte_tuple = tuple(bytes([b]) for b in word_bytes)
+
+        # 统计频率
+        token_frequency_table[byte_tuple] += 1
+
+    # ==================== 第5步：初始化 pair 频率统计 ====================
+    # 使用 defaultdict 方便计数
+    pair_counts = defaultdict(int)
+
+    # 遍历所有字节序列，统计相邻字节对频率
+    for byte_tuple, freq in token_frequency_table.items():
+        for i in range(len(byte_tuple) - 1):
+            pair = (byte_tuple[i], byte_tuple[i + 1])
+            pair_counts[pair] += freq
+
+    # ==================== 第6步：BPE 迭代合并 ====================
+    merges: List[Tuple[bytes, bytes]] = []  # 记录合并操作
+
+    while len(vocab) < vocab_size:
+        # 6.1 检查终止条件
+        if not pair_counts:
+            break  # 没有更多 pair 可以合并
+
+        # 6.2 选择最频繁的 pair
+        # 找到最大频率
+        max_count = max(pair_counts.values())
+
+        # 可能存在多个 pair 具有相同最高频率
+        # 选择字典序最大的 pair（确保与参考实现一致）
+        candidates = [pair for pair, count in pair_counts.items() if count == max_count]
+        best_pair = max(candidates)  # 元组比较：逐元素比较，选择最大的
+
+        # 6.3 创建新 token
+        new_token_bytes = best_pair[0] + best_pair[1]
+
+        # 添加到词汇表
+        vocab[next_token_id] = new_token_bytes
+        next_token_id += 1
+
+        # 记录合并操作（按顺序）
+        merges.append(best_pair)
+
+        # 6.4 增量更新 pair_counts（性能优化的关键）
+        # 只有包含 best_pair 的字节序列才会受影响
+        # 只需更新这些受影响的序列，而非全部重新统计
+
+        # 找出所有包含 best_pair 的字节序列
+        affected_tokens = []
+        for byte_tuple, freq in token_frequency_table.items():
+            # 检查字节序列中是否包含 best_pair
+            has_pair = False
+            for i in range(len(byte_tuple) - 1):
+                if byte_tuple[i:i+2] == best_pair:
+                    has_pair = True
+                    break
+            if has_pair:
+                affected_tokens.append((byte_tuple, freq))
+
+        # 对每个受影响的字节序列进行更新
+        for byte_tuple, freq in affected_tokens:
+            # a. 删除旧的 pair 计数
+            for i in range(len(byte_tuple) - 1):
+                old_pair = (byte_tuple[i], byte_tuple[i + 1])
+                pair_counts[old_pair] -= freq
+                # 删除计数为 0 或负的 pair（清理）
+                if pair_counts[old_pair] <= 0:
+                    del pair_counts[old_pair]
+
+            # b. 在字节序列中合并 best_pair
+            new_byte_tuple = _merge_pair_in_sequence(byte_tuple, best_pair, new_token_bytes)
+
+            # c. 添加新的 pair 计数
+            for i in range(len(new_byte_tuple) - 1):
+                new_pair = (new_byte_tuple[i], new_byte_tuple[i + 1])
+                pair_counts[new_pair] += freq
+
+            # d. 更新字节序列频率表
+            del token_frequency_table[byte_tuple]
+            token_frequency_table[new_byte_tuple] += freq
+
+    # ==================== 第7步：返回结果 ====================
+    return vocab, merges
+
+
+def _merge_pair_in_sequence(
+    byte_sequence: Tuple[bytes, ...],
+    pair: Tuple[bytes, bytes],
+    new_token: bytes,
+) -> Tuple[bytes, ...]:
+    """
+    在字节序列中合并指定的 pair
+
+    辅助函数：将所有出现的 pair 替换为 new_token
+
+    参数：
+        byte_sequence: 字节元组，如 (b'h', b'e', b'l', b'l', b'o')
+        pair: 要合并的字节对，如 (b'l', b'l')
+        new_token: 合并后的新 token，如 b'll'
+
+    返回：
+        合并后的新字节元组，如 (b'h', b'e', b'll', b'o')
+
+    示例：
+        >>> _merge_pair_in_sequence((b'h', b'e', b'l', b'l', b'o'), (b'l', b'l'), b'll')
+        (b'h', b'e', b'll', b'o')
+    """
+    pair_len = len(byte_sequence)
+
+    # 预分配结果列表（优化：避免动态扩容）
+    new_sequence = []
+    new_sequence_reserve = pair_len  # 预估最大大小
+    i = 0
+
+    # 提取 pair 的两个元素（优化：避免重复索引访问）
+    p1, p2 = pair
+
+    while i < pair_len:
+        # 检查当前位置是否是要合并的 pair
+        if i + 1 < pair_len and byte_sequence[i] == p1 and byte_sequence[i + 1] == p2:
+            # 找到要合并的 pair，替换为新 token
+            new_sequence.append(new_token)
+            i += 2  # 跳过两个元素
+        else:
+            # 不匹配，保留当前元素
+            new_sequence.append(byte_sequence[i])
+            i += 1
+
+    return tuple(new_sequence)
+
+
+# ==================== 辅助函数：保存和加载 ====================
+
+def save_vocab_and_merges(
+    vocab: dict[int, bytes],
+    merges: list[tuple[bytes, bytes]],
+    vocab_path: str,
+    merges_path: str,
+):
+    """
+    保存词汇表和合并规则到文件
+
+    参数：
+        vocab: 词汇表
+        merges: 合并规则列表
+        vocab_path: 词汇表保存路径
+        merges_path: 合并规则保存路径
+    """
+    import json
+
+    # 保存词汇表（可读格式）
+    # 将 bytes 转换为字符串以便存储
+    vocab_str = {
+        token_id: token_bytes.decode("utf-8", errors="replace")
+        for token_id, token_bytes in vocab.items()
+    }
+    with open(vocab_path, "w", encoding="utf-8") as f:
+        json.dump(vocab_str, f, ensure_ascii=False, indent=2)
+
+    # 保存合并规则
+    with open(merges_path, "w", encoding="utf-8") as f:
+        for p1, p2 in merges:
+            p1_str = p1.decode("utf-8", errors="replace")
+            p2_str = p2.decode("utf-8", errors="replace")
+            f.write(f"{p1_str} {p2_str}\n")
+
+
+# ==================== Tokenizer 类实现 ====================
+
+class Tokenizer:
+    """
+    BPE 分词器实现
+
+    支持的功能：
+    1. 编码文本为 token IDs
+    2. 解码 token IDs 为文本
+    3. 特殊 tokens 处理
+    4. 流式编码大文件
+    """
+
+    def __init__(
+        self,
+        vocab: dict[int, bytes],
+        merges: list[tuple[bytes, bytes]],
+        special_tokens: list[str] | None = None,
+    ):
+        """
+        从给定的词汇表、合并规则和特殊 tokens 构造分词器
+
+        参数：
+            vocab: dict[int, bytes] - Token ID 到 token 字节的映射
+            merges: list[tuple[bytes, bytes]] - 按合并顺序排列的合并规则
+            special_tokens: list[str] | None - 特殊 token 列表
+        """
+        # 词汇表：bytes -> int 的映射（用于快速查找）
+        self._vocab_bytes_to_id: dict[bytes, int] = {
+            v: k for k, v in vocab.items()
+        }
+        # 保存原始词汇表
+        self._vocab_id_to_bytes: dict[int, bytes] = vocab.copy()
+
+        # 合并规则：bytes pair -> 合并后的 bytes
+        self._merge_map: dict[tuple[bytes, bytes], bytes] = {}
+        for p1, p2 in merges:
+            merged = p1 + p2
+            self._merge_map[(p1, p2)] = merged
+
+        # 特殊 tokens
+        self._special_tokens: set[str] = set(special_tokens) if special_tokens else set()
+        # 特殊 tokens 的字节表示
+        self._special_token_bytes: dict[bytes, str] = {}
+        # 特殊 tokens 的 ID
+        self._special_token_ids: set[int] = set()
+
+        for st in self._special_tokens:
+            st_bytes = st.encode("utf-8")
+            self._special_token_bytes[st_bytes] = st
+            if st_bytes in self._vocab_bytes_to_id:
+                self._special_token_ids.add(self._vocab_bytes_to_id[st_bytes])
+
+        # 按长度降序排序特殊 tokens（用于优先匹配长 tokens）
+        self._sorted_special_tokens: list[tuple[bytes, str]] = sorted(
+            self._special_token_bytes.items(),
+            key=lambda x: len(x[0]),
+            reverse=True
+        )
+
+    @classmethod
+    def from_files(
+        cls,
+        vocab_filepath: str,
+        merges_filepath: str,
+        special_tokens: list[str] | None = None,
+    ) -> "Tokenizer":
+        """
+        从序列化的词汇表和合并规则文件构造分词器
+
+        参数：
+            vocab_filepath: 词汇表文件路径（JSON 格式）
+            merges_filepath: 合并规则文件路径
+            special_tokens: list[str] | None - 特殊 token 列表
+        """
+        import json
+
+        # 读取词汇表
+        with open(vocab_filepath, "r", encoding="utf-8") as f:
+            vocab_str = json.load(f)
+
+        vocab: dict[int, bytes] = {}
+        for token_id_str, token_str in vocab_str.items():
+            token_id = int(token_id_str)
+            token_bytes = token_str.encode("utf-8")
+            vocab[token_id] = token_bytes
+
+        # 读取合并规则
+        merges: list[tuple[bytes, bytes]] = []
+        with open(merges_filepath, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split()
+                if len(parts) == 2:
+                    p1 = parts[0].encode("utf-8")
+                    p2 = parts[1].encode("utf-8")
+                    merges.append((p1, p2))
+
+        return cls(vocab, merges, special_tokens)
+
+    def encode(self, text: str) -> list[int]:
+        """
+        编码输入文本为 token ID 序列
+
+        参数：
+            text: 输入文本
+
+        返回：
+            list[int]: token ID 序列
+        """
+        if not text:
+            return []
+
+        result = []
+        special_tokens_list = list(self._special_tokens)
+
+        # 使用统一的预分词函数处理普通文本部分
+        pre_tokens = _preprocess_text(text, special_tokens_list)
+
+        # 对每个预 token 进行编码
+        for word in pre_tokens:
+            word_bytes = word.encode("utf-8")
+            # 将字节数组转换为单个字节 tokens
+            tokens = [bytes([b]) for b in word_bytes]
+            # 应用 BPE 合并
+            merged = self._apply_bpe(tokens)
+            result.extend(merged)
+
+        # 处理特殊 tokens（需要单独提取它们）
+        if special_tokens_list:
+            chunks = _split_by_special_tokens(text, special_tokens_list)
+            for chunk in chunks:
+                if chunk in self._special_tokens:
+                    part_bytes = chunk.encode("utf-8")
+                    if part_bytes in self._vocab_bytes_to_id:
+                        result.append(self._vocab_bytes_to_id[part_bytes])
+
+        return result
+
+    def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
+        """
+        对字符串的可迭代对象（如文件句柄）进行流式编码
+
+        这个方法支持内存高效地处理大文件，不会一次性加载全部内容到内存
+
+        参数：
+            iterable: 可迭代的字符串集合
+
+        返回：
+            Iterator[int]: token ID 生成器
+        """
+        # 逐行处理，保持内存效率
+        for line in iterable:
+            ids = self.encode(line)
+            yield from ids
+
+    def decode(self, ids: list[int]) -> str:
+        """
+        解码 token ID 序列为文本
+
+        参数：
+            ids: token ID 序列
+
+        返回：
+            str: 解码后的文本
+
+        异常：
+            ValueError: 当遇到无效的 token ID 时抛出
+        """
+        if not ids:
+            return ""
+
+        # 收集所有 token 的字节
+        all_bytes = []
+        invalid_ids = []
+
+        for token_id in ids:
+            if token_id in self._vocab_id_to_bytes:
+                all_bytes.append(self._vocab_id_to_bytes[token_id])
+            else:
+                invalid_ids.append(token_id)
+
+        # 如果有无效 ID，抛出异常而不是静默处理
+        if invalid_ids:
+            raise ValueError(
+                f"发现无效的 token IDs: {invalid_ids}. "
+                f"这些 ID 不在词汇表（大小: {len(self._vocab_id_to_bytes)}）中。"
+            )
+
+        # 合并并解码
+        combined = b"".join(all_bytes)
+        return combined.decode("utf-8", errors="replace")
+
+    def _apply_bpe(self, tokens: list[bytes]) -> list[int]:
+        """
+        对字节 tokens 应用 BPE 合并规则
+
+        优化版本：增量更新 pair 位置，避免每次重新构建
+
+        参数：
+            tokens: 字节 token 列表
+
+        返回：
+            list[int]: 合并后的 token ID 列表
+        """
+        if len(tokens) <= 1:
+            return [self._vocab_bytes_to_id[t] for t in tokens if t in self._vocab_bytes_to_id]
+
+        # 初始化所有可合并的 pair 及其位置
+        pairs: dict[tuple[bytes, bytes], list[int]] = {}
+        for i in range(len(tokens) - 1):
+            pair = (tokens[i], tokens[i + 1])
+            if pair in self._merge_map:
+                pairs.setdefault(pair, []).append(i)
+
+        # 按优先级顺序应用合并规则
+        while pairs:
+            # 找到优先级最高的可合并 pair（按 merges 列表顺序）
+            best_pair = None
+            for p1, p2 in self._merge_map.keys():
+                if (p1, p2) in pairs and pairs[(p1, p2)]:
+                    best_pair = (p1, p2)
+                    break
+
+            if best_pair is None:
+                break
+
+            # 获取该 pair 的所有位置，并从后往前合并
+            positions = sorted(pairs[best_pair], reverse=True)
+            del pairs[best_pair]  # 移除已处理的 pair
+
+            if not positions:
+                continue
+
+            merged_token = self._merge_map[best_pair]
+            offset = 0
+
+            # 记录受影响的索引范围，用于增量更新 pairs
+            affected_indices = set()
+
+            for pos in positions:
+                actual_pos = pos + offset
+
+                # 验证位置有效性
+                if actual_pos >= len(tokens) - 1:
+                    continue
+
+                # 验证 pair 是否匹配（可能已被之前的合并改变）
+                if tokens[actual_pos] == best_pair[0] and tokens[actual_pos + 1] == best_pair[1]:
+                    # 记录受影响的范围
+                    affected_indices.add(actual_pos - 1)
+                    affected_indices.add(actual_pos)
+                    affected_indices.add(actual_pos + 1)
+
+                    # 执行合并
+                    tokens[actual_pos:actual_pos + 2] = [merged_token]
+                    offset -= 1
+
+            # 增量更新 pairs：只更新受影响的索引
+            for idx in affected_indices:
+                # 移除旧位置的 pair
+                if idx >= 0 and idx < len(tokens) - 1:
+                    old_pair = (tokens[idx], tokens[idx + 1])
+                    if old_pair in pairs and idx in pairs[old_pair]:
+                        pairs[old_pair].remove(idx)
+                        if not pairs[old_pair]:
+                            del pairs[old_pair]
+
+                # 添加新位置的 pair
+                if idx >= 0 and idx < len(tokens) - 1:
+                    new_pair = (tokens[idx], tokens[idx + 1])
+                    if new_pair in self._merge_map:
+                        pairs.setdefault(new_pair, []).append(idx)
+
+        # 将 bytes 转换为 IDs
+        result = []
+        for token in tokens:
+            if token in self._vocab_bytes_to_id:
+                result.append(self._vocab_bytes_to_id[token])
+            else:
+                # 降级处理：分解为单字节
+                for b in token:
+                    single_byte = bytes([b])
+                    if single_byte in self._vocab_bytes_to_id:
+                        result.append(self._vocab_bytes_to_id[single_byte])
+
+        return result
+
+
+# ==================== 测试和调试 ====================
+
+if __name__ == "__main__":
+    # 简单测试
+    test_text = "hello world hello world"
+    test_file = "/tmp/test_bpe.txt"
+
+    # 创建测试文件
+    with open(test_file, "w") as f:
+        f.write(test_text)
+
+    # 训练 BPE
+    vocab, merges = run_train_bpe(
+        input_path=test_file,
+        vocab_size=300,
+        special_tokens=["<eos>"]
+    )
+
+    print(f"词汇表大小: {len(vocab)}")
+    print(f"合并次数: {len(merges)}")
+    print(f"\n前 10 个合并:")
+    for i, (p1, p2) in enumerate(merges[:10]):
+        print(f"  {i+1}. {p1} + {p2} -> {p1 + p2}")
