@@ -99,8 +99,10 @@ class MultiHeadSelfAttention(nn.Module):
         if self.rope is not None:
             if token_positions is None:
                 token_positions = torch.arange(seq_len, device=x.device)
-            Q = self.rope(Q, token_positions)
-            K = self.rope(K, token_positions)
+            # Add heads dimension so RoPE broadcasts: (batch, seq) → (batch, 1, seq)
+            rope_positions = token_positions.unsqueeze(-2) if token_positions.dim() >= 1 else token_positions
+            Q = self.rope(Q, rope_positions)
+            K = self.rope(K, rope_positions)
 
         # Create causal mask
         # Shape: (seq_len, seq_len)

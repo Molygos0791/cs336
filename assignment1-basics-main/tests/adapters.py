@@ -2,15 +2,13 @@ from __future__ import annotations
 
 import os
 from collections.abc import Iterable
-from typing import IO, Any, BinaryIO,List,Tuple,Dict
+from typing import IO, Any, BinaryIO
 
 import numpy.typing as npt
 import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
-import re
-from collections import defaultdict
-import regex
+
 from homework.bpe_tokenizer import Tokenizer
 
 def run_linear(
@@ -538,7 +536,9 @@ def run_get_batch(
         is the sampled input sequences, and the second tuple item is the corresponding
         language modeling labels.
     """
-    raise NotImplementedError
+    from homework.data_loading import get_batch
+
+    return get_batch(dataset, batch_size, context_length, device)
 
 
 def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, " ..."]:
@@ -574,7 +574,9 @@ def run_cross_entropy(
     Returns:
         Float[Tensor, ""]: The average cross-entropy loss across examples.
     """
-    raise NotImplementedError
+    from homework.cross_entropy import cross_entropy
+
+    return cross_entropy(inputs, targets)
 
 
 def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float) -> None:
@@ -586,14 +588,18 @@ def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm:
 
     The gradients of the parameters (parameter.grad) should be modified in-place.
     """
-    raise NotImplementedError
+    from homework.gradient_clipping import gradient_clipping
+
+    gradient_clipping(parameters, max_l2_norm)
 
 
 def get_adamw_cls() -> Any:
     """
     Returns a torch.optim.Optimizer that implements AdamW.
     """
-    raise NotImplementedError
+    from homework.adamw import AdamW
+
+    return AdamW
 
 
 def run_get_lr_cosine_schedule(
@@ -621,7 +627,15 @@ def run_get_lr_cosine_schedule(
     Returns:
         Learning rate at the given iteration under the specified schedule.
     """
-    raise NotImplementedError
+    from homework.lr_schedule import lr_cosine_schedule
+
+    return lr_cosine_schedule(
+        it=it,
+        max_learning_rate=max_learning_rate,
+        min_learning_rate=min_learning_rate,
+        warmup_iters=warmup_iters,
+        cosine_cycle_iters=cosine_cycle_iters,
+    )
 
 
 def run_save_checkpoint(
@@ -640,7 +654,9 @@ def run_save_checkpoint(
             we've completed.
         out (str | os.PathLike | BinaryIO | IO[bytes]): Path or file-like object to serialize the model, optimizer, and iteration to.
     """
-    raise NotImplementedError
+    from homework.checkpoint import save_checkpoint
+
+    save_checkpoint(model, optimizer, iteration, out)
 
 
 def run_load_checkpoint(
@@ -661,7 +677,9 @@ def run_load_checkpoint(
     Returns:
         int: the previously-serialized number of iterations.
     """
-    raise NotImplementedError
+    from homework.checkpoint import load_checkpoint
+
+    return load_checkpoint(src, model, optimizer)
 
 
 def get_tokenizer(
@@ -671,132 +689,14 @@ def get_tokenizer(
 ) -> Any:
     return Tokenizer(vocab, merges, special_tokens)
 
-    
 
-GPT2_PATTERN = regex.compile(
-    r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
-    )
 def run_train_bpe(
-    input_path:str | os.PathLike,
-    vocab_size:int,
-    special_tokens:list[str],
+    input_path: str | os.PathLike,
+    vocab_size: int,
+    special_tokens: list[str],
     **kwargs,
-)-> tuple[dict[int,bytes],list[tuple[bytes,bytes]]]:
-    #step1:参数校验
-    if not isinstance(vocab_size,int) or vocab_size<=0:
-        raise ValueError("vocab_size 必须是正整数")
-    #step2初始化词汇表
-    vocab: Dict[int,bytes]= {i:bytes([i]) for i in range(256)}
-    next_token_id :int =256
+) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
+    from homework.bpe_tokenizer import run_train_bpe as _run_train_bpe
 
-    existing_bytes_values=set(vocab.values())
-
-    for st_str in special_tokens:
-        if len(vocab)>= vocab_size:
-            break
-        st_bytes=st_str.encode("utf-8")
-        if st_bytes not in existing_bytes_values:
-            vocab[next_token_id]=st_bytes
-            existing_bytes_values.add(st_bytes)
-            next_token_id+=1
-    #step3:读取训练预料
-    try :
-        with open(input_path,"r",encoding="utf-8",errors="ignore") as f:
-            text = f.read()
-    except FileNotFoundError:
-        text="" #文件不存在时视为空文本
-    #step4:预处理和预分词
-    ##4.1 按特殊tokens分割
-    if special_tokens:
-        split_pattern = "|".join(re.escape(tok) for tok in special_tokens)
-        chunks = regex.split(split_pattern,text)
-    else:
-        chunks=[text]
-    ##4.2 对每个chunk进行预分词
-    token_frequency_table = defaultdict(int)
-    for chunk in chunks:
-        for word in regex.findall(GPT2_PATTERN,chunk):
-            word_bytes = word.encode("utf-8")
-            byte_tuple=tuple(bytes([b]) for b in word_bytes)
-            token_frequency_table[byte_tuple]+=1
-    #step5:初始化 pair 频率统计
-    pair_counts=defaultdict(int)
-    for byte_tuple,freq in token_frequency_table.items():
-        for i in range(len(byte_tuple)-1):
-            pair=(byte_tuple[i],byte_tuple[i+1])
-            pair_counts[pair]+=freq
-    #step6: BPE迭代合并
-    merges:List[Tuple[bytes,bytes]]=[]
-    while len(vocab)<vocab_size:
-        #检查终止条件:
-        if not pair_counts:
-            break
-        #选择最频繁的pair
-        max_count=max(pair_counts.values())
-        candidates=[pair for pair,count in pair_counts.items() if count == max_count]
-        best_pair=max(candidates)
-        #创建新token
-        new_token_bytes=best_pair[0]+best_pair[1]
-        vocab[next_token_id]=new_token_bytes
-        next_token_id+=1
-        merges.append(best_pair)
-        #增量更新pair_counts(性能优化的关键)
-        affected_tokens=[]
-        for byte_tuple,freq in token_frequency_table.items():
-            has_pair = False
-            for i in range(len(byte_tuple)-1):
-                if byte_tuple[i] == best_pair[0] and byte_tuple[i+1] == best_pair[1]:
-                    has_pair = True
-                    break
-            if has_pair:
-                affected_tokens.append((byte_tuple,freq))
-        for byte_tuple,freq in affected_tokens:
-             for i in range(len(byte_tuple)-1):
-                old_pair = (byte_tuple[i],byte_tuple[i+1])
-                pair_counts[old_pair]-= freq
-                if pair_counts[old_pair] <=0:                        
-                    del pair_counts[old_pair]
-             new_byte_tuple = _merge_pair_in_sequence(byte_tuple,best_pair,new_token_bytes)
-             for i in range(len(new_byte_tuple)-1):
-                new_pair=(new_byte_tuple[i],new_byte_tuple[i+1])
-                pair_counts[new_pair]+= freq
-             del token_frequency_table[byte_tuple]
-             token_frequency_table[new_byte_tuple]+= freq
-    return vocab,merges
-
-
-def _merge_pair_in_sequence(
-    byte_sequence:tuple[bytes,...],
-    pair:tuple[bytes,bytes],
-    new_token:bytes,
-)-> tuple[bytes,...]:
-    new_sequence=[]
-    i=0
-    while i < len(byte_sequence):
-        if i < len(byte_sequence)-1 and byte_sequence[i] == pair[0] and byte_sequence[i+1] == pair[1]:
-            new_sequence.append(new_token)
-            i+=2
-        else:
-            new_sequence.append(byte_sequence[i])
-            i+=1
-    return tuple(new_sequence)
-
-def save_vocab_and_merges(
-        vocab:dict[int,bytes],
-        merges:list[tuple[bytes,bytes]],
-        vocab_path:str,
-        merges_path:str,
-):  
-    import json
-    vocab_str={
-        token_id:token_bytes.decode("utf-8",errors="replace")
-        for token_id,token_bytes in vocab.items()
-    }
-    with open(vocab_path,"w",encoding="utf-8") as f:
-        json.dump(vocab_str, f, ensure_ascii=False, indent=2)
-    with open(merges_path,"w",encoding="utf-8") as f:
-        for p1,p2 in merges:
-            p1_str=p1.decode("utf-8",errors="replace")
-            p2_str=p2.decode("utf-8",errors="replace")
-            f.write(f"{p1_str} {p2_str}\n")
+    return _run_train_bpe(input_path, vocab_size, special_tokens, **kwargs)
 

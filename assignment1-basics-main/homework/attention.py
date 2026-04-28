@@ -5,6 +5,7 @@ from jaxtyping import Bool, Float
 from torch import Tensor
 import math
 from einops import einsum
+from homework.softmax import softmax
 
 
 def scaled_dot_product_attention(
@@ -41,7 +42,7 @@ def scaled_dot_product_attention(
 
     # Apply softmax along the last dimension (keys dimension)
     # Using our softmax implementation for numerical stability
-    from homework.softmax import softmax
+
     attn_weights = softmax(scores, dim=-1)
 
     # Compute output: attention_weights @ V

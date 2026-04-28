@@ -12,6 +12,7 @@ import torch
 import torch.nn as nn
 from jaxtyping import Float, Int
 from torch import Tensor
+from einops import repeat
 
 from homework.embedding import Embedding
 from homework.linear import Linear
@@ -116,7 +117,10 @@ class TransformerLM(nn.Module):
 
         # Generate token positions if not provided
         if token_positions is None:
-            token_positions = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand(batch_size, -1)
+            token_positions = repeat(
+                torch.arange(seq_len, device=input_ids.device),
+                "s -> b s", b=batch_size,
+            )
 
         # Step 1: Token embeddings
         # Shape: (batch_size, sequence_length, d_model)

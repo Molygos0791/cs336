@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from jaxtyping import Float, Int
 from torch import Tensor
-from einops import rearrange
+from einops import rearrange, einsum
 
 
 class RotaryPositionalEmbedding(nn.Module):
@@ -41,7 +41,7 @@ class RotaryPositionalEmbedding(nn.Module):
 
         # Compute the angles: position * freq for each position and frequency
         # Shape: (max_seq_len, d_k // 2)
-        angles = torch.outer(positions, freqs)
+        angles = einsum(positions, freqs, "pos, freq -> pos freq")
 
         # Precompute cos and sin caches
         self.register_buffer("cos_cache", angles.cos(), persistent=False)
